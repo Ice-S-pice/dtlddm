@@ -11,6 +11,21 @@
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <script type="module">
+      const localHosts = new Set(["localhost", "127.0.0.1", "::1"]);
+
+      if (localHosts.has(window.location.hostname)) {
+        import("/src/main.jsx");
+      } else {
+        const basePath = window.location.pathname.startsWith("/dtlddm") ? "/dtlddm" : "";
+        const stylesheet = document.createElement("link");
+        stylesheet.rel = "stylesheet";
+        stylesheet.crossOrigin = "";
+        stylesheet.href = `${basePath}/assets/main-COkxmgis.css`;
+        document.head.appendChild(stylesheet);
+
+        import(/* @vite-ignore */ `${basePath}/assets/main-GalDIBcB.js`);
+      }
+    </script>
   </body>
 </html>
