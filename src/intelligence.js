@@ -83,7 +83,7 @@ function buildDailyForecast(recipes, scenario) {
         weekdayMultiplier(date.getDay()) *
         (scenario.demandIndex / 100) *
         (1 + recipe.trend * 0.45);
-      const eventDemand = eventPortion * (recipe.popularity / totalPopularity);
+      const eventDemand = totalPopularity > 0 ? eventPortion * (recipe.popularity / totalPopularity) : 0;
       return {
         recipeId: recipe.id,
         units: Math.max(0, Math.round(demand + eventDemand)),
@@ -232,7 +232,9 @@ function buildMenuInsights(recipes, enrichedInventory, usageData) {
       const limitingIngredient = recipe.ingredients
         .map((line) => {
           const item = inventoryMap.get(line.id);
-          const dailyNeed = line.qty * (recipe.dailyBase || 1);
+          // Même base de calcul que buildRecipeStockAdvice : besoin journalier
+          // ajusté du taux de perte, pour ne pas diverger entre les deux écrans.
+          const dailyNeed = line.qty * (1 + (item?.wasteRate || 0)) * (recipe.dailyBase || 1);
           return {
             item,
             cover: item && dailyNeed > 0 ? item.currentStock / dailyNeed : 99,
@@ -438,7 +440,9 @@ function secondaryDueOffset(batch, dateType) {
 function buildSwissAutocontrol(enrichedInventory, batches, controlChecks = []) {
   const inventoryMap = new Map(enrichedInventory.map((item) => [item.id, item]));
   const lotRegister = batches
-    .filter((batch) => Number(batch.qty) > 0)
+    // Les ajustements d'inventaire (comptage qui trouve du stock en plus) ne sont
+    // pas des lots reçus : pas de fournisseur/lot/DLC réels, donc hors registre.
+    .filter((batch) => Number(batch.qty) > 0 && !batch.adjustment)
     .map((batch) => {
       const ingredient = inventoryMap.get(batch.ingredientId);
       const dateType = inferDateType(ingredient || {}, batch);
@@ -521,7 +525,7 @@ function buildSwissAutocontrol(enrichedInventory, batches, controlChecks = []) {
   };
 }
 
-function buildAlerts(enrichedInventory, menuInsights, swissAutocontrol) {
+function buildAlerts(enrichedInventory, recipeStockAdvice, swissAutocontrol) {
   const alerts = [];
   const expired = enrichedInventory.filter((item) => item.expiredQty > 0);
   const stockouts = enrichedInventory.filter((item) => item.stockoutRisk);
@@ -533,7 +537,8 @@ function buildAlerts(enrichedInventory, menuInsights, swissAutocontrol) {
   const parReviews = enrichedInventory
     .filter((item) => item.parStale)
     .sort((a, b) => Math.abs(b.parDrift) - Math.abs(a.parDrift));
-  const menuRisks = menuInsights.filter((item) => item.action.startsWith("Stock trop juste"));
+  // Source unique : l'analyse de stock par recette (mêmes chiffres que l'onglet Conseils).
+  const menuRisks = (recipeStockAdvice || []).filter((recipe) => recipe.severity === "danger");
 
   if (swissAutocontrol?.secondaryMissing?.length) {
     alerts.push({
@@ -677,7 +682,7 @@ export function buildIntelligence({
     batches,
     controlChecks,
   );
-  const alerts = buildAlerts(enrichedInventory, menuInsights, swissAutocontrol);
+  const alerts = buildAlerts(enrichedInventory, recipeStockAdvice, swissAutocontrol);
   const wasteByCategory = buildWasteByCategory(enrichedInventory);
   const revenue = Array.from(usageData.revenueByRecipe.values()).reduce((sum, value) => sum + value, 0);
   const usageCost = Array.from(usageData.usage.entries()).reduce((sum, [id, qty]) => {

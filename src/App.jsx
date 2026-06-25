@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import {
   defaultScenario,
+  neutralScenario,
   recipes as seedRecipes,
   seedBatches,
   seedIngredients,
@@ -190,6 +191,7 @@ function emptyRestaurant() {
     recipes: [],
     controlChecks,
     logs: [],
+    scenario: neutralScenario,
   };
 }
 
@@ -200,11 +202,18 @@ function demoRestaurant() {
     recipes: seedRecipes,
     controlChecks,
     logs: seedLogs,
+    scenario: defaultScenario,
   };
 }
 
 function sanitizeRestaurantState(state) {
   const source = state && typeof state === "object" ? state : {};
+  // Ré-ancrage des dates : les offsets sont stockés en jours par rapport au jour
+  // de sauvegarde (savedAt). On les décale du temps écoulé pour qu'ils restent
+  // relatifs à aujourd'hui. shift <= 0 pour une sauvegarde passée ; nouvel offset
+  // = ancien + (savedAt - aujourd'hui).
+  const savedAtDate = parseISODate(source.savedAt);
+  const shift = savedAtDate ? daysBetween(savedAtDate) : 0;
   const ingredients = Array.isArray(source.ingredients)
     ? source.ingredients.filter((item) => item?.id).map((item) => {
         const unit = item.unit || "kg";
@@ -237,19 +246,19 @@ function sanitizeRestaurantState(state) {
           const dlcOffset = Number.isFinite(parseFormNumber(batch.dlcOffset)) ? parseFormNumber(batch.dlcOffset) : null;
           const ddmOffset = Number.isFinite(parseFormNumber(batch.ddmOffset)) ? parseFormNumber(batch.ddmOffset) : null;
           const expiryOffset = numberOr(batch.expiryOffset, dlcOffset ?? ddmOffset ?? 0);
+          const openedOffset = Number.isFinite(parseFormNumber(batch.openedOffset)) ? parseFormNumber(batch.openedOffset) : null;
+          const secondaryExpiryOffset = Number.isFinite(parseFormNumber(batch.secondaryExpiryOffset))
+            ? parseFormNumber(batch.secondaryExpiryOffset)
+            : null;
           return {
             ...batch,
             qty: Math.max(0, numberOr(batch.qty, 0)),
-            receivedOffset: numberOr(batch.receivedOffset, 0),
-            expiryOffset,
-            ...(dlcOffset !== null ? { dlcOffset } : {}),
-            ...(ddmOffset !== null ? { ddmOffset } : {}),
-            ...(Number.isFinite(parseFormNumber(batch.openedOffset))
-              ? { openedOffset: parseFormNumber(batch.openedOffset) }
-              : {}),
-            ...(Number.isFinite(parseFormNumber(batch.secondaryExpiryOffset))
-              ? { secondaryExpiryOffset: parseFormNumber(batch.secondaryExpiryOffset) }
-              : {}),
+            receivedOffset: numberOr(batch.receivedOffset, 0) + shift,
+            expiryOffset: expiryOffset + shift,
+            ...(dlcOffset !== null ? { dlcOffset: dlcOffset + shift } : {}),
+            ...(ddmOffset !== null ? { ddmOffset: ddmOffset + shift } : {}),
+            ...(openedOffset !== null ? { openedOffset: openedOffset + shift } : {}),
+            ...(secondaryExpiryOffset !== null ? { secondaryExpiryOffset: secondaryExpiryOffset + shift } : {}),
           };
         })
         .filter((batch) => batch.id && batch.ingredientId && batch.qty > 0)
@@ -270,7 +279,12 @@ function sanitizeRestaurantState(state) {
       }))
         .filter((recipe) => recipe.ingredients.length > 0)
     : [];
-  const { manualOrders: _manualOrders, orders: _orders, ...restState } = source;
+  const {
+    manualOrders: _manualOrders,
+    orders: _orders,
+    savedAt: _savedAt,
+    ...restState
+  } = source;
 
   return {
     ...emptyRestaurant(),
@@ -278,6 +292,7 @@ function sanitizeRestaurantState(state) {
     ingredients,
     batches,
     recipes,
+    scenario: source.scenario || neutralScenario,
     controlChecks: Array.isArray(source.controlChecks) ? source.controlChecks : controlChecks,
     logs: Array.isArray(source.logs) ? source.logs : [],
   };
@@ -348,7 +363,8 @@ function stockQuantityLabel(qty, unit) {
 
 function App() {
   const [data, setData] = useState(initialState);
-  const scenario = defaultScenario;
+  // Vraies données = scénario neutre ; la démo embarque son propre scénario riche.
+  const scenario = data.scenario || neutralScenario;
   const [activeTab, setActiveTab] = useState("stock");
   const [currentDate, setCurrentDate] = useState(() => new Date());
   const [theme, setTheme] = useState(() => localStorage.getItem("brigade-theme") || "light");
@@ -360,6 +376,7 @@ function App() {
   const [category, setCategory] = useState("Tous");
   const [editingProduct, setEditingProduct] = useState(null);
   const [deletePrompt, setDeletePrompt] = useState(null);
+  const [confirmAction, setConfirmAction] = useState(null);
   const [tourOpen, setTourOpen] = useState(false);
   const [forms, setForms] = useState({
     receiveIngredient: "",
@@ -398,7 +415,10 @@ function App() {
   });
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    // On estampille le jour de référence des offsets de dates. Au rechargement,
+    // sanitizeRestaurantState décale les offsets du nombre de jours écoulés, sinon
+    // les DLC/DDM (stockées en jours relatifs) glisseraient dans le futur.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...data, savedAt: toISODate(new Date()) }));
   }, [data]);
 
   useEffect(() => {
@@ -414,6 +434,15 @@ function App() {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [deletePrompt]);
+
+  useEffect(() => {
+    if (!confirmAction) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setConfirmAction(null);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [confirmAction]);
 
   useEffect(() => {
     const firstIngredient = data.ingredients[0]?.id;
@@ -549,6 +578,31 @@ function App() {
     }));
   }
 
+  // Charger la démo écrase les données réelles : on confirme si le restaurant
+  // contient déjà des produits.
+  function requestLoadDemo() {
+    if (data.ingredients.length > 0) {
+      setConfirmAction({
+        title: "Charger la démo ?",
+        body: "Les produits, lots et recettes actuels seront remplacés par le jeu de démonstration.",
+        confirmLabel: "Charger la démo",
+        onConfirm: loadDemoData,
+      });
+    } else {
+      loadDemoData();
+    }
+  }
+
+  function requestReset() {
+    setConfirmAction({
+      title: "Vider le restaurant ?",
+      body: "Tous les produits, lots, recettes et mouvements seront définitivement supprimés.",
+      confirmLabel: "Tout vider",
+      tone: "danger",
+      onConfirm: resetRestaurant,
+    });
+  }
+
   function createProduct(event) {
     event.preventDefault();
     const name = forms.productName.trim();
@@ -574,7 +628,10 @@ function App() {
     });
     const dateType = initialDlcOffset !== null ? "DLC" : initialDdmOffset !== null ? "DDM" : inferredDateType;
     const selectedExpiryOffset = dateType === "DLC" ? initialDlcOffset : initialDdmOffset;
-    const shelfLife = Math.max(1, selectedExpiryOffset ?? 5);
+    // Durée de conservation par défaut du produit, indépendante des jours restants
+    // de la 1re livraison (ajustable ensuite via la fiche produit). Le lot, lui,
+    // utilise la date réellement saisie.
+    const shelfLife = 5;
     const initialExpiryOffset = selectedExpiryOffset ?? shelfLife;
 
     const product = {
@@ -704,6 +761,7 @@ function App() {
             receivedOffset: 0,
             expiryOffset: Math.max(parseFormNumber(editingProduct.shelfLife) || 5, 1),
             dateType: inferProductDateType(editingProduct),
+            adjustment: true,
           },
         ];
       } else if (delta < 0) {
@@ -952,9 +1010,11 @@ function App() {
 
     setData((current) => ({
       ...current,
+      // La réception met à jour le prix facturé mais NE résout PAS l'écart
+      // théorie/réel (seul un comptage le fait) et ne compte pas comme un inventaire.
       ingredients: current.ingredients.map((item) =>
         item.id === ingredient.id
-          ? { ...item, previousPrice: item.price, price, variance: 0, lastCounted: "maintenant" }
+          ? { ...item, previousPrice: item.price, price }
           : item,
       ),
       batches: [...current.batches, batch],
@@ -992,6 +1052,7 @@ function App() {
             receivedOffset: 0,
             expiryOffset: Math.max(ingredient.shelfLife - 1, 1),
             dateType: inferProductDateType(ingredient),
+            adjustment: true,
           },
         ];
       } else if (delta < 0) {
@@ -1024,12 +1085,12 @@ function App() {
     const qty = parseFormNumber(forms.wasteQty);
     if (!ingredient || !qty || qty <= 0) return;
 
+    // Une perte est une sortie EXPLIQUÉE : on retire la quantité des lots (FEFO) et
+    // on la journalise, sans la rajouter à l'écart théorie/réel (sinon elle serait
+    // comptée deux fois dans le risque et signalée comme écart à investiguer).
     setData((current) => ({
       ...current,
       batches: reduceFromOldestLots(current.batches, ingredient.id, qty),
-      ingredients: current.ingredients.map((item) =>
-        item.id === ingredient.id ? { ...item, variance: round((item.variance || 0) - qty, 2) } : item,
-      ),
       logs: [
         addLog({
           type: "Perte",
@@ -1041,33 +1102,6 @@ function App() {
       ],
     }));
     setForms((current) => ({ ...current, wasteQty: "" }));
-  }
-
-  function signControl(checkId) {
-    const check = (data.controlChecks || controlChecks).find((entry) => entry.id === checkId);
-    if (!check) return;
-    setData((current) => ({
-      ...current,
-      controlChecks: (current.controlChecks || controlChecks).map((entry) =>
-        entry.id === checkId
-          ? {
-              ...entry,
-              status: "done",
-              owner: "Vous",
-              evidence: `Signé à ${new Date().toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" })}`,
-            }
-          : entry,
-      ),
-      logs: [
-        addLog({
-          type: "Registre",
-          item: check.label,
-          qty: "OK",
-          note: `${check.area} · ${check.cadence}`,
-        }),
-        ...(current.logs || []),
-      ],
-    }));
   }
 
   function createSecondaryLabel(batchId) {
@@ -1134,7 +1168,8 @@ function App() {
         ].join(";"),
       ),
     ].join("\n");
-    const blob = new Blob([lines], { type: "text/csv;charset=utf-8" });
+    // Prefixe BOM (\uFEFF) pour qu'Excel lise correctement les accents en UTF-8.
+    const blob = new Blob(["\uFEFF" + lines], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -1237,9 +1272,9 @@ function App() {
             forms={forms}
             updateForm={updateForm}
             createProduct={createProduct}
-            loadDemoData={loadDemoData}
+            loadDemoData={requestLoadDemo}
             startTour={startTour}
-            resetRestaurant={resetRestaurant}
+            resetRestaurant={requestReset}
             applyRecommendedPar={applyRecommendedPar}
             editingProduct={editingProduct}
             startEditProduct={startEditProduct}
@@ -1294,6 +1329,9 @@ function App() {
           onCancel={() => setDeletePrompt(null)}
           onConfirm={confirmDeleteProduct}
         />
+      )}
+      {confirmAction && (
+        <ConfirmModal prompt={confirmAction} onCancel={() => setConfirmAction(null)} />
       )}
       {tourOpen && (
         <TourGuide steps={tourSteps} setActiveTab={setActiveTab} onClose={() => setTourOpen(false)} />
@@ -1515,6 +1553,46 @@ function ConfirmDeleteModal({ item, onCancel, onConfirm }) {
           </button>
           <button className="danger-button" type="button" onClick={onConfirm}>
             Supprimer
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ConfirmModal({ prompt, onCancel }) {
+  const danger = prompt.tone === "danger";
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+    >
+      <section className="delete-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-action-title">
+        <button className="modal-close" type="button" onClick={onCancel} aria-label="Fermer">
+          <XCircle size={18} />
+        </button>
+        <div className={`modal-icon${danger ? " danger" : ""}`}>
+          <AlertTriangle size={22} />
+        </div>
+        <p className="eyebrow">Confirmation</p>
+        <h2 id="confirm-action-title">{prompt.title}</h2>
+        <p className="modal-copy">{prompt.body}</p>
+        <div className="modal-actions">
+          <button className="ghost-button" type="button" onClick={onCancel}>
+            Annuler
+          </button>
+          <button
+            className={danger ? "danger-button" : "primary-button"}
+            type="button"
+            onClick={() => {
+              prompt.onConfirm();
+              onCancel();
+            }}
+          >
+            {prompt.confirmLabel}
           </button>
         </div>
       </section>
@@ -2884,176 +2962,6 @@ function TraceabilityRegister({
   );
 }
 
-function Compliance({
-  intelligence,
-  checks,
-  signControl,
-  createSecondaryLabel,
-  exportAutocontrol,
-}) {
-  const swiss = intelligence.swissAutocontrol;
-  const scoreStyle = {
-    background: `conic-gradient(#087f8c ${swiss.score * 3.6}deg, #eceae3 0deg)`,
-  };
-
-  return (
-    <section className="compliance-layout">
-      <div className="panel compliance-hero">
-        <div>
-          <p className="eyebrow">Registre Suisse</p>
-          <h2>{swiss.nextAction}</h2>
-          <div className="compliance-metrics">
-            <span>
-              <strong>{swiss.traceOk}%</strong>
-              traçabilité
-            </span>
-            <span>
-              <strong>{swiss.blockedLots.length}</strong>
-              lots bloqués
-            </span>
-            <span>
-              <strong>{swiss.secondaryMissing.length}</strong>
-              étiquettes
-            </span>
-          </div>
-        </div>
-        <div className="score-ring" style={scoreStyle}>
-          <div>
-            <strong>{swiss.score}</strong>
-            <span>/100</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="panel checklist-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Actions</p>
-            <h2>Registre du jour</h2>
-          </div>
-          <button className="ghost-button compact" type="button" onClick={exportAutocontrol}>
-            <FileText size={16} />
-            <span>CSV</span>
-          </button>
-        </div>
-        <div className="check-list">
-          {checks.map((check) => (
-            <article className={`check-row ${check.status}`} key={check.id}>
-              <div>
-                <strong>{check.label}</strong>
-                <span>
-                  {check.area} · {check.due} · {check.evidence}
-                </span>
-              </div>
-              {check.status === "done" ? (
-                <span className="signed-pill">
-                  <CheckCircle2 size={14} />
-                  Signé
-                </span>
-              ) : (
-                <button className="ghost-button compact" type="button" onClick={() => signControl(check.id)}>
-                  <ShieldCheck size={15} />
-                  <span>Signer</span>
-                </button>
-              )}
-            </article>
-          ))}
-        </div>
-      </div>
-
-      <div className="panel evidence-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Preuves</p>
-            <h2>À garder sous la main</h2>
-          </div>
-          <FileText size={22} />
-        </div>
-        <div className="evidence-list">
-          <article>
-            <strong>Factures / bons de livraison</strong>
-            <span>Relier fournisseur, date, produit, quantité et lot.</span>
-          </article>
-          <article>
-            <strong>Étiquettes DLC/DDM</strong>
-            <span>Conserver l'information utile dans le registre, surtout pour les produits sensibles.</span>
-          </article>
-          <article>
-            <strong>Actions correctives</strong>
-            <span>Signer les pertes, isolations, retours fournisseur et étiquettes secondaires.</span>
-          </article>
-        </div>
-      </div>
-
-      <div className="panel trace-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Lots</p>
-            <h2>Traçabilité DLC/DDM</h2>
-          </div>
-          <Tag size={22} />
-        </div>
-        <div className="trace-table">
-          <table>
-            <thead>
-              <tr>
-                <th>Lot</th>
-                <th>Produit</th>
-                <th>Réception</th>
-                <th>DLC/DDM</th>
-                <th>Interne</th>
-                <th>Statut</th>
-              </tr>
-            </thead>
-            <tbody>
-              {swiss.lotRegister.slice(0, 12).map((lot) => (
-                <tr key={lot.id}>
-                  <td>
-                    <strong>{lot.lot}</strong>
-                    <span>{lotDateTypeLabel(lot)}</span>
-                  </td>
-                  <td>
-                    <div className="product-cell">
-                      <strong>{lot.ingredientName}</strong>
-                      <span>
-                        {lot.supplier} · {lot.zone}
-                      </span>
-                    </div>
-                  </td>
-                  <td>{dateLabel(lot.receivedOffset)}</td>
-                  <td className={lot.dateExpired ? "negative" : lot.expiryOffset <= 2 ? "warning-text" : ""}>
-                    <div className="lot-stack">
-                      <LotDatePills lot={lot} />
-                    </div>
-                  </td>
-                  <td>
-                    {lot.opened ? (
-                      lot.needsSecondary ? (
-                        <button className="link-btn" type="button" onClick={() => createSecondaryLabel(lot.id)}>
-                          Générer
-                        </button>
-                      ) : (
-                        dateLabel(lot.secondaryOffset)
-                      )
-                    ) : (
-                      "fermé"
-                    )}
-                  </td>
-                  <td>
-                    <span className={`trace-status ${lot.status.toLowerCase().replace(" ", "-")}`}>
-                      {lot.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function Operations({
   ingredients,
   inventory,
@@ -3180,6 +3088,8 @@ function Operations({
       cancelled = true;
       stopScanner();
     };
+    // applyReceiveCode est volontairement hors deps : la recréer relancerait le scanner.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scannerOpen, ingredients]);
 
   function adjustCount(delta) {

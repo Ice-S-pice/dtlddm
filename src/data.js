@@ -431,6 +431,17 @@ export const defaultScenario = {
   wasteDiscipline: 72,
 };
 
+// Scénario neutre appliqué aux vraies données : pas d'évènement fictif, pas de
+// gonflage de la demande ni de marge de sécurité inventée. wasteDiscipline 60 =
+// point neutre (disciplineGain nul). Le scénario riche reste réservé à la démo.
+export const neutralScenario = {
+  demandIndex: 100,
+  eventCovers: 0,
+  supplierDelay: 0,
+  safetyBuffer: 0,
+  wasteDiscipline: 60,
+};
+
 export const controlChecks = [
   {
     id: "trace-reception",
